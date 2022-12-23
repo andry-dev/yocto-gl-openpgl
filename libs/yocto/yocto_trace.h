@@ -69,15 +69,16 @@ namespace yocto {
 
 // Type of tracing algorithm
 enum struct trace_sampler_type {
-  path,        // path tracing
-  pathdirect,  // path tracing with direct
-  pathmis,     // path tracing with mis
-  pathtest,    // path tracing test
-  naive,       // naive path tracing
-  eyelight,    // eyelight rendering
-  diagram,     // diagram rendering
-  furnace,     // furnace test
-  falsecolor,  // false color rendering
+  path,         // path tracing
+  pathdirect,   // path tracing with direct
+  pathmis,      // path tracing with mis
+  pathtest,     // path tracing test
+  pathguiding,  // path guiding
+  naive,        // naive path tracing
+  eyelight,     // eyelight rendering
+  diagram,      // diagram rendering
+  furnace,      // furnace test
+  falsecolor,   // false color rendering
 };
 // Type of false color visualization
 enum struct trace_falsecolor_type {
@@ -233,7 +234,8 @@ namespace yocto {
 
 // trace sampler names
 inline const auto trace_sampler_names = vector<string>{"path", "pathdirect",
-    "pathmis", "pathtest", "naive", "eyelight", "furnace", "falsecolor"};
+    "pathmis", "pathtest", "pathguiding", "naive", "eyelight", "furnace",
+    "falsecolor"};
 
 // false color names
 inline const auto trace_falsecolor_names = vector<string>{"position", "normal",
@@ -247,6 +249,7 @@ inline const auto trace_sampler_labels =
         {trace_sampler_type::pathdirect, "pathdirect"},
         {trace_sampler_type::pathmis, "pathmis"},
         {trace_sampler_type::pathtest, "pathtest"},
+        {trace_sampler_type::pathguiding, "pathguiding"},
         {trace_sampler_type::naive, "naive"},
         {trace_sampler_type::eyelight, "eyelight"},
         {trace_sampler_type::diagram, "diagram"},

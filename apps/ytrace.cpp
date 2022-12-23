@@ -26,7 +26,6 @@
 // POSSIBILITY OF SUCH DAMAGE.
 //
 
-#include <openpgl/cpp/OpenPGL.h>
 #include <yocto/yocto_cli.h>
 #include <yocto/yocto_gui.h>
 #include <yocto/yocto_math.h>
