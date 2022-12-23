@@ -26,6 +26,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 //
 
+#include <openpgl/cpp/OpenPGL.h>
 #include <yocto/yocto_cli.h>
 #include <yocto/yocto_gui.h>
 #include <yocto/yocto_math.h>
@@ -33,6 +34,8 @@
 #include <yocto/yocto_sceneio.h>
 #include <yocto/yocto_shape.h>
 #include <yocto/yocto_trace.h>
+
+#include "/home/andry/prj/yocto-gl/exts/openpgl/openpgl/include/openpgl/cpp/OpenPGL.h"
 
 using namespace yocto;
 using namespace std::string_literals;
