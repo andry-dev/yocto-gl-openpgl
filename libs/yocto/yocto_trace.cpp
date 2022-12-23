@@ -1528,6 +1528,7 @@ bool is_sampler_lit(const trace_params& params) {
     case trace_sampler_type::path: return true;
     case trace_sampler_type::pathdirect: return true;
     case trace_sampler_type::pathmis: return true;
+    case trace_sampler_type::pathguiding: return true;
     case trace_sampler_type::naive: return true;
     case trace_sampler_type::eyelight: return false;
     case trace_sampler_type::furnace: return true;
