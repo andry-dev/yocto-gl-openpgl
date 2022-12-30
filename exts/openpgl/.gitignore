@@ -1,7 +1,0 @@
-*~
-*#
-build*
-install*
-doxygen
-.vscode
-doc/tmp/*
