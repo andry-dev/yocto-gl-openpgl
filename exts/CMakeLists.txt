@@ -3,9 +3,9 @@ add_subdirectory(nlohmann_json)
 add_subdirectory(stb_image)
 add_subdirectory(tinyexr)
 add_subdirectory(cgltf)
-add_subdirectory(openpgl)
-
-add_library(openpgl::openpgl ALIAS openpgl)
+# add_subdirectory(openpgl)
+#
+# add_library(openpgl::openpgl ALIAS openpgl)
 
 if(YOCTO_OPENGL)
 

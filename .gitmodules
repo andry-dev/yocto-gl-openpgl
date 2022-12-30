@@ -1,0 +1,3 @@
+[submodule "exts/openpgl"]
+	path = exts/openpgl
+	url = https://github.com/OpenPathGuidingLibrary/openpgl

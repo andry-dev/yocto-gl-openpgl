@@ -28,10 +28,12 @@
 
 #include "yocto_trace.h"
 
+// #include <openpgl/cpp/Device.h>
+// #include <openpgl/cpp/Field.h>
+#include <openpgl/config.h>
 #include <openpgl/cpp/OpenPGL.h>
 
 #include <algorithm>
-#include <cstring>
 #include <future>
 #include <memory>
 #include <stdexcept>
@@ -85,6 +87,13 @@ inline void parallel_for(T num1, T num2, Func&& func) {
 // IMPLEMENTATION OF RAY-SCENE INTERSECTION
 // -----------------------------------------------------------------------------
 namespace yocto {
+
+// PGL_DEVICE_TYPE_CPU_4  = SSE4.2
+// PGL_DEVICE_TYPE_CPU_8  = AVX256
+// PGL_DEVICE_TYPE_CPU_16 = AVX512
+static openpgl::cpp::Device g_opgl_device{PGL_DEVICE_TYPE_CPU_8};
+
+static openpgl::cpp::SampleStorage g_opgl_samples;
 
 // Build the Bvh acceleration structure.
 trace_bvh make_trace_bvh(const scene_data& scene, const trace_params& params) {
@@ -1113,6 +1122,13 @@ static trace_result trace_naive(const scene_data& scene, const trace_bvh& bvh,
 static trace_result trace_pathguiding(const scene_data& scene,
     const trace_bvh& bvh, const trace_lights& lights, const ray3f& ray_,
     rng_state& rng, const trace_params& params) {
+  static openpgl::cpp::FieldArguments field_arguments{};
+  pglFieldArgumentsSetDefaults(field_arguments, PGL_SPATIAL_STRUCTURE_KDTREE,
+      PGL_DIRECTIONAL_DISTRIBUTION_PARALLAX_AWARE_VMM);
+
+  static auto field = openpgl::cpp::Field{&g_opgl_device, field_arguments};
+  // static openpgl::cpp::SurfaceSamplingDistribution opgl_surface_distribution;
+
   // initialize
   auto radiance   = vec3f{0, 0, 0};
   auto weight     = vec3f{1, 1, 1};

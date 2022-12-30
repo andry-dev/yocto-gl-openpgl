@@ -25,3 +25,4 @@ Debug/
 Release/
 .cache
 compile_commands.json
+.install_dir

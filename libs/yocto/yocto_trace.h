@@ -155,6 +155,7 @@ struct trace_state {
   vector<int>       hits     = {};
   vector<rng_state> rngs     = {};
   vector<vec4f>     denoised = {};
+  // openpgl::cpp::VolumeSamplingDistribution opgl_volume_distribution;
 };
 
 // Initialize state.

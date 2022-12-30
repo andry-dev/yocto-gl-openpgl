@@ -14,16 +14,19 @@ add_library(yocto STATIC
   yocto_parallel.h yocto_cli.h
 )
 
+find_package(openpgl REQUIRED)
+
 set_target_properties(yocto PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)
 target_include_directories(yocto PRIVATE ext/)
 target_include_directories(yocto PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/..")
+# target_include_directories(yocto openpgl::openpgl)
 
 target_link_libraries(yocto PRIVATE fast_float)
 target_link_libraries(yocto PRIVATE nlohmann_json::nlohmann_json)
 target_link_libraries(yocto PRIVATE stb_image::stb_image)
 target_link_libraries(yocto PRIVATE tinyexr::tinyexr)
 target_link_libraries(yocto PRIVATE cgltf::cgltf)
-target_link_libraries(yocto PRIVATE openpgl)
+target_link_libraries(yocto PUBLIC openpgl::openpgl)
 
 if(UNIX AND NOT APPLE)
   find_package(Threads REQUIRED)
