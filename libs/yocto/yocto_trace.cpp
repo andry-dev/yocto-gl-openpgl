@@ -39,6 +39,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "yocto/yocto_math.h"
 #include "yocto_color.h"
 #include "yocto_geometry.h"
 #include "yocto_sampling.h"
@@ -91,7 +92,7 @@ namespace yocto {
 // PGL_DEVICE_TYPE_CPU_4  = SSE4.2
 // PGL_DEVICE_TYPE_CPU_8  = AVX256
 // PGL_DEVICE_TYPE_CPU_16 = AVX512
-static openpgl::cpp::Device g_opgl_device{PGL_DEVICE_TYPE_CPU_8};
+static openpgl::cpp::Device g_opgl_device{PGL_DEVICE_TYPE_CPU_4};
 
 static openpgl::cpp::SampleStorage g_opgl_samples;
 
@@ -1122,12 +1123,16 @@ static trace_result trace_naive(const scene_data& scene, const trace_bvh& bvh,
 static trace_result trace_pathguiding(const scene_data& scene,
     const trace_bvh& bvh, const trace_lights& lights, const ray3f& ray_,
     rng_state& rng, const trace_params& params) {
-  static openpgl::cpp::FieldArguments field_arguments{};
-  pglFieldArgumentsSetDefaults(field_arguments, PGL_SPATIAL_STRUCTURE_KDTREE,
-      PGL_DIRECTIONAL_DISTRIBUTION_PARALLAX_AWARE_VMM);
+  static auto field = []() {
+    openpgl::cpp::FieldArguments field_arguments{};
+    pglFieldArgumentsSetDefaults(field_arguments, PGL_SPATIAL_STRUCTURE_KDTREE,
+        PGL_DIRECTIONAL_DISTRIBUTION_QUADTREE);
+    return openpgl::cpp::Field{&g_opgl_device, field_arguments};
+  }();
+  openpgl::cpp::PathSegmentStorage path_segment_storage;
+  path_segment_storage.Reserve(params.bounces);
 
-  static auto field = openpgl::cpp::Field{&g_opgl_device, field_arguments};
-  // static openpgl::cpp::SurfaceSamplingDistribution opgl_surface_distribution;
+  openpgl::cpp::SurfaceSamplingDistribution surface_distrib{&field};
 
   // initialize
   auto radiance   = vec3f{0, 0, 0};
@@ -1140,6 +1145,9 @@ static trace_result trace_pathguiding(const scene_data& scene,
 
   // trace  path
   for (auto bounce = 0; bounce < params.bounces; bounce++) {
+    auto path_segment = path_segment_storage.NextSegment();
+    assert(path_segment);
+
     // intersect next point
     auto intersection = intersect_scene(bvh, scene, ray);
     if (!intersection.hit) {
@@ -1153,6 +1161,7 @@ static trace_result trace_pathguiding(const scene_data& scene,
     auto position = eval_shading_position(scene, intersection, outgoing);
     auto normal   = eval_shading_normal(scene, intersection, outgoing);
     auto material = eval_material(scene, intersection);
+    auto emission = eval_emission(material, normal, outgoing);
 
     // handle opacity
     if (material.opacity < 1 && rand1f(rng) >= material.opacity) {
@@ -1170,22 +1179,30 @@ static trace_result trace_pathguiding(const scene_data& scene,
     }
 
     // accumulate emission
-    radiance += weight * eval_emission(material, normal, outgoing);
+    radiance += weight * emission;
 
     // next direction
-    auto incoming = vec3f{0, 0, 0};
+    auto incoming          = vec3f{0, 0, 0};
+    auto scattering_weight = vec3f{0, 0, 0};
     if (material.roughness != 0) {
       incoming = sample_bsdfcos(
           material, normal, outgoing, rand1f(rng), rand2f(rng));
       if (incoming == vec3f{0, 0, 0}) break;
-      weight *= eval_bsdfcos(material, normal, outgoing, incoming) /
-                sample_bsdfcos_pdf(material, normal, outgoing, incoming);
+      const auto bsdf = eval_bsdfcos(material, normal, outgoing, incoming);
+      const auto pdf = sample_bsdfcos_pdf(material, normal, outgoing, incoming);
+      scattering_weight = bsdf / pdf;
+      openpgl::cpp::SetPDFDirectionIn(path_segment, pdf);
     } else {
       incoming = sample_delta(material, normal, outgoing, rand1f(rng));
       if (incoming == vec3f{0, 0, 0}) break;
-      weight *= eval_delta(material, normal, outgoing, incoming) /
-                sample_delta_pdf(material, normal, outgoing, incoming);
+      const auto delta = eval_delta(material, normal, outgoing, incoming);
+      const auto pdf   = sample_delta_pdf(material, normal, outgoing, incoming);
+      scattering_weight = delta / pdf;
+      openpgl::cpp::SetIsDelta(path_segment, true);
+      openpgl::cpp::SetPDFDirectionIn(path_segment, pdf);
     }
+
+    weight *= scattering_weight;
 
     // check weight
     if (weight == vec3f{0, 0, 0} || !isfinite(weight)) break;
@@ -1195,11 +1212,40 @@ static trace_result trace_pathguiding(const scene_data& scene,
       auto rr_prob = min((float)0.99, max(weight));
       if (rand1f(rng) >= rr_prob) break;
       weight *= 1 / rr_prob;
+      openpgl::cpp::SetRussianRouletteProbability(path_segment, rr_prob);
     }
+
+    openpgl::cpp::SetPosition(
+        path_segment, {position.x, position.y, position.z});
+    openpgl::cpp::SetNormal(path_segment, {normal.x, normal.y, normal.z});
+    openpgl::cpp::SetRoughness(path_segment, material.roughness);
+    openpgl::cpp::SetDirectionOut(
+        path_segment, {outgoing.x, outgoing.y, outgoing.z});
+    openpgl::cpp::SetVolumeScatter(path_segment, false);
+    openpgl::cpp::SetDirectContribution(
+        path_segment, {emission.x, emission.y, emission.z});
+    openpgl::cpp::SetScatteringWeight(path_segment,
+        {scattering_weight.x, scattering_weight.y, scattering_weight.z});
+    openpgl::cpp::SetDirectionIn(
+        path_segment, {incoming.x, incoming.y, incoming.z});
+
+    // if (bounce > 3) {
+    //   // Sample a ray
+    //   const auto guided_sample = surface_distrib.Sample(
+    //       {rand1f(rng), rand1f(rng)});
+    //   incoming = {guided_sample.x, guided_sample.y, guided_sample.z};
+    // }
 
     // setup next iteration
     ray = {position, incoming};
   }
+
+  auto n_generated_samples = path_segment_storage.PrepareSamples(
+      false, nullptr, false, true, true);
+  auto generated_samples = path_segment_storage.GetSamples(n_generated_samples);
+
+  g_opgl_samples.AddSamples(generated_samples, n_generated_samples);
+  field.Update(g_opgl_samples);
 
   return {radiance, hit, hit_albedo, hit_normal};
 }
