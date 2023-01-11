@@ -37,6 +37,10 @@
 // INCLUDES
 // -----------------------------------------------------------------------------
 
+#include <openpgl/cpp/PathSegmentStorage.h>
+#include <openpgl/cpp/Region.h>
+#include <openpgl/cpp/SurfaceSamplingDistribution.h>
+
 #include <atomic>
 #include <future>
 #include <memory>
@@ -144,17 +148,21 @@ struct trace_bvh {
 // Check is a sampler requires lights
 bool is_sampler_lit(const trace_params& params);
 
+// Per-thread path guiding data
+struct guiding_data {};
+
 // Trace state
 struct trace_state {
-  int               width    = 0;
-  int               height   = 0;
-  int               samples  = 0;
-  vector<vec4f>     image    = {};
-  vector<vec3f>     albedo   = {};
-  vector<vec3f>     normal   = {};
-  vector<int>       hits     = {};
-  vector<rng_state> rngs     = {};
-  vector<vec4f>     denoised = {};
+  int                  width         = 0;
+  int                  height        = 0;
+  int                  samples       = 0;
+  vector<vec4f>        image         = {};
+  vector<vec3f>        albedo        = {};
+  vector<vec3f>        normal        = {};
+  vector<int>          hits          = {};
+  vector<rng_state>    rngs          = {};
+  vector<vec4f>        denoised      = {};
+  vector<guiding_data> guiding_datas = {};
   // openpgl::cpp::VolumeSamplingDistribution opgl_volume_distribution;
 };
 

@@ -34,8 +34,6 @@
 #include <yocto/yocto_shape.h>
 #include <yocto/yocto_trace.h>
 
-#include "/home/andry/prj/yocto-gl/exts/openpgl/openpgl/include/openpgl/cpp/OpenPGL.h"
-
 using namespace yocto;
 using namespace std::string_literals;
 

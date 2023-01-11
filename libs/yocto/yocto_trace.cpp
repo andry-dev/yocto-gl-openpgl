@@ -32,11 +32,14 @@
 // #include <openpgl/cpp/Field.h>
 #include <openpgl/config.h>
 #include <openpgl/cpp/OpenPGL.h>
+#include <openpgl/cpp/Region.h>
+#include <openpgl/pathsegmentstorage.h>
 
 #include <algorithm>
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -90,14 +93,65 @@ inline void parallel_for(T num1, T num2, Func&& func) {
 // -----------------------------------------------------------------------------
 namespace yocto {
 
+namespace details {
+auto get_default_field_arguments() {
+  openpgl::cpp::FieldArguments field_arguments{};
+  pglFieldArgumentsSetDefaults(field_arguments,
+      PGL_SPATIAL_STRUCTURE_TYPE::PGL_SPATIAL_STRUCTURE_KDTREE,
+      PGL_DIRECTIONAL_DISTRIBUTION_TYPE::
+          PGL_DIRECTIONAL_DISTRIBUTION_PARALLAX_AWARE_VMM);
+  // reinterpret_cast<PGLKDTreeArguments*>(
+  //     field_arguments.spatialSturctureArguments)
+  //     ->maxDepth = 32;
+  return field_arguments;
+}
+}  // namespace details
+
+struct guiding_field {
+  guiding_field(openpgl::cpp::Device& device)
+      : m_field{&device, details::get_default_field_arguments()} {}
+
+  bool update(openpgl::cpp::SampleStorage& sample_storage) {
+    std::lock_guard<std::mutex> lock{m_update_lock};
+    const auto                  num_samples = sample_storage.GetSizeSurface();
+    if (num_samples >= 2048) {
+      m_field.Update(sample_storage);
+      sample_storage.Clear();
+      return true;
+    }
+
+    return false;
+  }
+
+  openpgl::cpp::SurfaceSamplingDistribution
+  create_sample_surface_distribution() {
+    return openpgl::cpp::SurfaceSamplingDistribution{&m_field};
+  }
+
+  bool init_surface_distrib(
+      openpgl::cpp::SurfaceSamplingDistribution& distribution, vec3f position,
+      float random_float) {
+    std::lock_guard<std::mutex> guard{m_update_lock};
+    auto                        result = distribution.Init(
+        &m_field, {position.x, position.y, position.z}, random_float);
+    return result;
+  }
+
+ private:
+  openpgl::cpp::Field m_field;
+  std::mutex          m_update_lock;
+  std::mutex          m_init_lock;
+};
+
 // PGL_DEVICE_TYPE_CPU_4  = SSE4.2
 // PGL_DEVICE_TYPE_CPU_8  = AVX256
 // PGL_DEVICE_TYPE_CPU_16 = AVX512
-static openpgl::cpp::Device g_opgl_device{PGL_DEVICE_TYPE_CPU_4};
+static openpgl::cpp::Device g_opgl_device{PGL_DEVICE_TYPE_CPU_8};
 
 static openpgl::cpp::SampleStorage g_opgl_samples;
 
-constexpr float g_path_guiding_prob = 1.0f;
+constexpr float      g_path_guiding_prob = 0.50f;
+static guiding_field g_guiding_field{g_opgl_device};
 
 // Build the Bvh acceleration structure.
 trace_bvh make_trace_bvh(const scene_data& scene, const trace_params& params) {
@@ -467,7 +521,7 @@ struct trace_result {
 // Recursive path tracing.
 static trace_result trace_path(const scene_data& scene, const trace_bvh& bvh,
     const trace_lights& lights, const ray3f& ray_, rng_state& rng,
-    const trace_params& params) {
+    const trace_params& params, guiding_data&) {
   // initialize
   auto radiance      = vec3f{0, 0, 0};
   auto weight        = vec3f{1, 1, 1};
@@ -613,7 +667,7 @@ static trace_result trace_path(const scene_data& scene, const trace_bvh& bvh,
 // Recursive path tracing.
 static trace_result trace_pathdirect(const scene_data& scene,
     const trace_bvh& bvh, const trace_lights& lights, const ray3f& ray_,
-    rng_state& rng, const trace_params& params) {
+    rng_state& rng, const trace_params& params, guiding_data&) {
   // initialize
   auto radiance      = vec3f{0, 0, 0};
   auto weight        = vec3f{1, 1, 1};
@@ -784,7 +838,7 @@ static trace_result trace_pathdirect(const scene_data& scene,
 // Recursive path tracing with MIS.
 static trace_result trace_pathmis(const scene_data& scene, const trace_bvh& bvh,
     const trace_lights& lights, const ray3f& ray_, rng_state& rng,
-    const trace_params& params) {
+    const trace_params& params, guiding_data&) {
   // initialize
   auto radiance      = vec3f{0, 0, 0};
   auto weight        = vec3f{1, 1, 1};
@@ -967,7 +1021,7 @@ static trace_result trace_pathmis(const scene_data& scene, const trace_bvh& bvh,
 // Recursive path tracing.
 static trace_result trace_pathtest(const scene_data& scene,
     const trace_bvh& bvh, const trace_lights& lights, const ray3f& ray_,
-    rng_state& rng, const trace_params& params) {
+    rng_state& rng, const trace_params& params, guiding_data&) {
   // initialize
   auto radiance      = vec3f{0, 0, 0};
   auto weight        = vec3f{1, 1, 1};
@@ -1046,7 +1100,7 @@ static trace_result trace_pathtest(const scene_data& scene,
 // Recursive path tracing.
 static trace_result trace_naive(const scene_data& scene, const trace_bvh& bvh,
     const trace_lights& lights, const ray3f& ray_, rng_state& rng,
-    const trace_params& params) {
+    const trace_params& params, guiding_data&) {
   // initialize
   auto radiance   = vec3f{0, 0, 0};
   auto weight     = vec3f{1, 1, 1};
@@ -1125,18 +1179,11 @@ static trace_result trace_naive(const scene_data& scene, const trace_bvh& bvh,
 // Recursive path tracing with path guiding.
 static trace_result trace_pathguiding(const scene_data& scene,
     const trace_bvh& bvh, const trace_lights& lights, const ray3f& ray_,
-    rng_state& rng, const trace_params& params) {
-  static std::mutex field_lock{};
-  static auto       field = []() {
-    openpgl::cpp::FieldArguments field_arguments{};
-    pglFieldArgumentsSetDefaults(field_arguments, PGL_SPATIAL_STRUCTURE_KDTREE,
-              PGL_DIRECTIONAL_DISTRIBUTION_QUADTREE);
-    return openpgl::cpp::Field{&g_opgl_device, field_arguments};
-  }();
-  openpgl::cpp::PathSegmentStorage path_segment_storage;
-  path_segment_storage.Reserve(params.bounces);
+    rng_state& rng, const trace_params& params, guiding_data& guiding) {
+  auto path_segments = openpgl::cpp::PathSegmentStorage{};
+  path_segments.Reserve(params.bounces);
 
-  openpgl::cpp::SurfaceSamplingDistribution surface_distrib{&field};
+  auto surface_distrib = g_guiding_field.create_sample_surface_distribution();
 
   // initialize
   auto radiance   = vec3f{0, 0, 0};
@@ -1158,11 +1205,6 @@ static trace_result trace_pathguiding(const scene_data& scene,
       break;
     }
 
-    auto path_segment = path_segment_storage.NextSegment();
-    if (!path_segment) {
-      std::printf("Can't add path segment to the end of the storage list\n");
-    }
-
     // prepare shading point
     auto outgoing = -ray.d;
     auto position = eval_shading_position(scene, intersection, outgoing);
@@ -1171,18 +1213,6 @@ static trace_result trace_pathguiding(const scene_data& scene,
     auto emission = eval_emission(material, normal, outgoing);
 
     const auto needs_delta_function = material.roughness == 0;
-
-    openpgl::cpp::SetPosition(
-        path_segment, {position.x, position.y, position.z});
-    openpgl::cpp::SetNormal(path_segment, {normal.x, normal.y, normal.z});
-    openpgl::cpp::SetRoughness(path_segment, material.roughness);
-    openpgl::cpp::SetDirectionOut(
-        path_segment, {outgoing.x, outgoing.y, outgoing.z});
-    openpgl::cpp::SetVolumeScatter(path_segment, false);
-    openpgl::cpp::SetDirectContribution(
-        path_segment, {emission.x, emission.y, emission.z});
-    openpgl::cpp::SetEta(path_segment, material.ior);
-    openpgl::cpp::SetIsDelta(path_segment, needs_delta_function);
 
     // // handle opacity
     if (material.opacity < 1 && rand1f(rng) >= material.opacity) {
@@ -1202,22 +1232,43 @@ static trace_result trace_pathguiding(const scene_data& scene,
     // accumulate emission
     radiance += weight * emission;
 
-    auto       randf     = rand1f(rng);
-    const auto can_guide = [&]() {
-      std::scoped_lock<std::mutex> lock{field_lock};
-      return surface_distrib.Init(
-          &field, {position.x, position.y, position.z}, randf);
+    auto path_segment = path_segments.NextSegment();
+    if (!path_segment) {
+      std::printf("Failed to create a new path segment\n");
+    }
+
+    openpgl::cpp::SetPosition(
+        path_segment, {position.x, position.y, position.z});
+    openpgl::cpp::SetRoughness(path_segment, material.roughness);
+    openpgl::cpp::SetDirectionOut(
+        path_segment, {outgoing.x, outgoing.y, outgoing.z});
+    openpgl::cpp::SetVolumeScatter(path_segment, false);
+    openpgl::cpp::SetDirectContribution(
+        path_segment, {emission.x, emission.y, emission.z});
+    openpgl::cpp::SetEta(path_segment, material.ior);
+    openpgl::cpp::SetIsDelta(path_segment, needs_delta_function);
+
+    auto       rand_guiding_probability = rand1f(rng);
+    const bool should_use_guiding       = rand_guiding_probability <
+                                    g_path_guiding_prob;
+    const bool can_init_guiding_distrib = [&]() {
+      return g_guiding_field.init_surface_distrib(
+          surface_distrib, position, rand_guiding_probability);
     }();
-    const auto should_use_guiding = can_guide;
-    // && rand1f(rng) < g_path_guiding_prob;
+    const bool guiding_in_use = should_use_guiding && can_init_guiding_distrib;
 
     const auto sample_new_direction = [&]() {
-      if (should_use_guiding) {
+      if (guiding_in_use) {
+        surface_distrib.ApplyCosineProduct({normal.x, normal.y, normal.z});
         auto guided_direction = surface_distrib.Sample(
             {rand1f(rng), rand1f(rng)});
+        // rand_guiding_probability /= g_path_guiding_prob;
         return vec3f{
             guided_direction.x, guided_direction.y, guided_direction.z};
       }
+
+      // rand_guiding_probability -= g_path_guiding_prob;
+      // rand_guiding_probability /= 1.0f - g_path_guiding_prob;
 
       if (!needs_delta_function) {
         // Sample a new direction with just the BSDF
@@ -1231,8 +1282,6 @@ static trace_result trace_pathguiding(const scene_data& scene,
 
     auto incoming = sample_new_direction();
     if (incoming == vec3f{0, 0, 0}) break;
-    openpgl::cpp::SetDirectionIn(
-        path_segment, {incoming.x, incoming.y, incoming.z});
 
     auto bsdf = vec3f{0.0f, 0.0f, 0.0f};
     auto pdf  = 0.0f;
@@ -1245,17 +1294,32 @@ static trace_result trace_pathguiding(const scene_data& scene,
       pdf  = sample_delta_pdf(material, normal, outgoing, incoming);
     }
 
-    if (should_use_guiding) {
-      std::printf("Used path guiding when calculating PDF\n");
-      auto       direction   = pgl_vec3f{incoming.x, incoming.y, incoming.z};
-      const auto guiding_pdf = surface_distrib.SamplePDF(
+    // Adjust the PDF based on if we were able or not to use path guiding.
+    if (guiding_in_use) {
+      // We won the lottery and we used guiding for sampling the new direction.
+
+      // std::printf("Using path guiding\n");
+      auto       direction = pgl_vec3f{incoming.x, incoming.y, incoming.z};
+      const auto guided_sample_pdf = surface_distrib.SamplePDF(
           {rand1f(rng), rand1f(rng)}, direction);
 
       // Prob BSDF * PDF + Prob Guiding * GPDF
-      pdf = (1 - g_path_guiding_prob) * pdf + g_path_guiding_prob * guiding_pdf;
-    }
+      pdf *= (1.0f - g_path_guiding_prob);
+      pdf += g_path_guiding_prob * guided_sample_pdf;
+    } else if (can_init_guiding_distrib) {
+      // We lost the lottery and we didn't use guiding while it _was possible_
+      // to do so. In this case we adjust the total PDF to account for the
+      // missed chance.
 
-    openpgl::cpp::SetPDFDirectionIn(path_segment, pdf);
+      auto       direction   = pgl_vec3f{incoming.x, incoming.y, incoming.z};
+      const auto guiding_pdf = surface_distrib.PDF(direction);
+      const auto before_pdf  = pdf;
+      pdf *= (1.0f - g_path_guiding_prob);
+      pdf += g_path_guiding_prob * guiding_pdf;
+
+      // std::printf(
+      //     "Wanted to use guiding but couldn't: %f -> %f\n", before_pdf, pdf);
+    }
 
     const auto scattering_weight = bsdf / pdf;
     weight *= scattering_weight;
@@ -1267,6 +1331,10 @@ static trace_result trace_pathguiding(const scene_data& scene,
 
     openpgl::cpp::SetScatteringWeight(path_segment,
         {scattering_weight.x, scattering_weight.y, scattering_weight.z});
+    openpgl::cpp::SetNormal(path_segment, {normal.x, normal.y, normal.z});
+    openpgl::cpp::SetDirectionIn(
+        path_segment, {incoming.x, incoming.y, incoming.z});
+    openpgl::cpp::SetPDFDirectionIn(path_segment, pdf);
 
     // russian roulette
     if (bounce > 3) {
@@ -1280,20 +1348,23 @@ static trace_result trace_pathguiding(const scene_data& scene,
     ray = {position, incoming};
   }
 
-  if (!path_segment_storage.Validate()) {
-    std::printf("Path segment storage not valid\n");
-  }
+  // if (!path_segments.ValidateSamples()) {
+  //   std::printf("Path segment storage not valid\n");
+  // }
 
-  auto n_generated_samples = path_segment_storage.PrepareSamples(
+  auto n_generated_samples = path_segments.PrepareSamples(
       false, nullptr, false, false, true);
-  auto generated_samples = path_segment_storage.GetSamples(n_generated_samples);
-
-  g_opgl_samples.AddSamples(generated_samples, n_generated_samples);
 
   if (n_generated_samples > 0) {
-    std::lock_guard<std::mutex> lock_guard{field_lock};
-    field.Update(g_opgl_samples);
+    auto generated_samples = path_segments.GetSamples(n_generated_samples);
+    g_opgl_samples.AddSamples(generated_samples, n_generated_samples);
+    g_guiding_field.update(g_opgl_samples);
   }
+
+  // std::printf("Currently stored %lu samples\n", current_samples);
+
+  // if (g_opgl_samples.GetSizeSurface() > 10000) {
+  // }
 
   return {radiance, hit, hit_albedo, hit_normal};
 }
@@ -1612,7 +1683,7 @@ static trace_result trace_falsecolor(const scene_data& scene,
 // Trace a single ray from the camera using the given algorithm.
 using sampler_func = trace_result (*)(const scene_data& scene,
     const trace_bvh& bvh, const trace_lights& lights, const ray3f& ray,
-    rng_state& rng, const trace_params& params);
+    rng_state& rng, const trace_params& params, guiding_data& guiding);
 static sampler_func get_trace_sampler_func(const trace_params& params) {
   switch (params.sampler) {
     case trace_sampler_type::path: return trace_path;
@@ -1621,10 +1692,10 @@ static sampler_func get_trace_sampler_func(const trace_params& params) {
     case trace_sampler_type::pathtest: return trace_pathtest;
     case trace_sampler_type::pathguiding: return trace_pathguiding;
     case trace_sampler_type::naive: return trace_naive;
-    case trace_sampler_type::eyelight: return trace_eyelight;
-    case trace_sampler_type::diagram: return trace_diagram;
-    case trace_sampler_type::furnace: return trace_furnace;
-    case trace_sampler_type::falsecolor: return trace_falsecolor;
+    // case trace_sampler_type::eyelight: return trace_eyelight;
+    // case trace_sampler_type::diagram: return trace_diagram;
+    // case trace_sampler_type::furnace: return trace_furnace;
+    // case trace_sampler_type::falsecolor: return trace_falsecolor;
     default: {
       throw std::runtime_error("sampler unknown");
       return nullptr;
@@ -1659,8 +1730,8 @@ void trace_sample(trace_state& state, const scene_data& scene,
   auto  idx     = state.width * j + i;
   auto  ray     = sample_camera(camera, {i, j}, {state.width, state.height},
            rand2f(state.rngs[idx]), rand2f(state.rngs[idx]), params.tentfilter);
-  auto [radiance, hit, albedo, normal] = sampler(
-      scene, bvh, lights, ray, state.rngs[idx], params);
+  auto [radiance, hit, albedo, normal] = sampler(scene, bvh, lights, ray,
+      state.rngs[idx], params, state.guiding_datas[idx]);
   if (!isfinite(radiance)) radiance = {0, 0, 0};
   if (max(radiance) > params.clamp)
     radiance = radiance * (params.clamp / max(radiance));
@@ -1709,6 +1780,8 @@ trace_state make_trace_state(
   if (params.denoise) {
     state.denoised.assign(state.width * state.height, {0, 0, 0, 0});
   }
+
+  state.guiding_datas.assign(state.width * state.height, {});
   return state;
 }
 
