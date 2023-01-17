@@ -28,17 +28,9 @@
 
 #include "yocto_trace.h"
 
-// #include <openpgl/cpp/Device.h>
-// #include <openpgl/cpp/Field.h>
-#include <openpgl/config.h>
-#include <openpgl/cpp/OpenPGL.h>
-#include <openpgl/cpp/Region.h>
-#include <openpgl/pathsegmentstorage.h>
-
 #include <algorithm>
 #include <future>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -46,6 +38,7 @@
 #include "yocto/yocto_math.h"
 #include "yocto_color.h"
 #include "yocto_geometry.h"
+#include "yocto_guiding.h"
 #include "yocto_sampling.h"
 #include "yocto_shading.h"
 #include "yocto_shape.h"
@@ -93,56 +86,6 @@ inline void parallel_for(T num1, T num2, Func&& func) {
 // -----------------------------------------------------------------------------
 namespace yocto {
 
-namespace details {
-auto get_default_field_arguments() {
-  openpgl::cpp::FieldArguments field_arguments{};
-  pglFieldArgumentsSetDefaults(field_arguments,
-      PGL_SPATIAL_STRUCTURE_TYPE::PGL_SPATIAL_STRUCTURE_KDTREE,
-      PGL_DIRECTIONAL_DISTRIBUTION_TYPE::
-          PGL_DIRECTIONAL_DISTRIBUTION_PARALLAX_AWARE_VMM);
-  // reinterpret_cast<PGLKDTreeArguments*>(
-  //     field_arguments.spatialSturctureArguments)
-  //     ->maxDepth = 32;
-  return field_arguments;
-}
-}  // namespace details
-
-struct guiding_field {
-  guiding_field(openpgl::cpp::Device& device)
-      : m_field{&device, details::get_default_field_arguments()} {}
-
-  bool update(openpgl::cpp::SampleStorage& sample_storage) {
-    std::lock_guard<std::mutex> lock{m_update_lock};
-    const auto                  num_samples = sample_storage.GetSizeSurface();
-    if (num_samples >= 2048) {
-      m_field.Update(sample_storage);
-      sample_storage.Clear();
-      return true;
-    }
-
-    return false;
-  }
-
-  openpgl::cpp::SurfaceSamplingDistribution
-  create_sample_surface_distribution() {
-    return openpgl::cpp::SurfaceSamplingDistribution{&m_field};
-  }
-
-  bool init_surface_distrib(
-      openpgl::cpp::SurfaceSamplingDistribution& distribution, vec3f position,
-      float random_float) {
-    std::lock_guard<std::mutex> guard{m_update_lock};
-    auto                        result = distribution.Init(
-        &m_field, {position.x, position.y, position.z}, random_float);
-    return result;
-  }
-
- private:
-  openpgl::cpp::Field m_field;
-  std::mutex          m_update_lock;
-  std::mutex          m_init_lock;
-};
-
 // PGL_DEVICE_TYPE_CPU_4  = SSE4.2
 // PGL_DEVICE_TYPE_CPU_8  = AVX256
 // PGL_DEVICE_TYPE_CPU_16 = AVX512
@@ -150,7 +93,6 @@ static openpgl::cpp::Device g_opgl_device{PGL_DEVICE_TYPE_CPU_8};
 
 static openpgl::cpp::SampleStorage g_opgl_samples;
 
-constexpr float      g_path_guiding_prob = 0.50f;
 static guiding_field g_guiding_field{g_opgl_device};
 
 // Build the Bvh acceleration structure.
@@ -1183,169 +1125,267 @@ static trace_result trace_pathguiding(const scene_data& scene,
   auto path_segments = openpgl::cpp::PathSegmentStorage{};
   path_segments.Reserve(params.bounces);
 
-  auto surface_distrib = g_guiding_field.create_sample_surface_distribution();
+  auto surface_distrib = g_guiding_field.create_sample_distribution<
+      openpgl::cpp::SurfaceSamplingDistribution>();
+  auto volume_distrib = g_guiding_field.create_sample_distribution<
+      openpgl::cpp::VolumeSamplingDistribution>();
 
   // initialize
-  auto radiance   = vec3f{0, 0, 0};
-  auto weight     = vec3f{1, 1, 1};
-  auto ray        = ray_;
-  auto hit        = false;
-  auto hit_albedo = vec3f{0, 0, 0};
-  auto hit_normal = vec3f{0, 0, 0};
-  auto opbounce   = 0;
+  auto radiance     = vec3f{0, 0, 0};
+  auto weight       = vec3f{1, 1, 1};
+  auto ray          = ray_;
+  auto volume_stack = vector<material_point>{};
+  auto hit          = false;
+  auto hit_albedo   = vec3f{0, 0, 0};
+  auto hit_normal   = vec3f{0, 0, 0};
+  auto opbounce     = 0;
+
+  // MIS helpers
+  auto mis_heuristic = [](float this_pdf, float other_pdf) {
+    return (this_pdf * this_pdf) /
+           (this_pdf * this_pdf + other_pdf * other_pdf);
+  };
 
   int bounce = 0;
   // trace  path
   for (bounce = 0; bounce < params.bounces; bounce++) {
     // intersect next point
     auto intersection = intersect_scene(bvh, scene, ray);
+
     if (!intersection.hit) {
-      if (bounce > 0 || !params.envhidden)
+      if ((bounce > 0 || !params.envhidden))
         radiance += weight * eval_environment(scene, ray.d);
       break;
     }
-
-    // prepare shading point
-    auto outgoing = -ray.d;
-    auto position = eval_shading_position(scene, intersection, outgoing);
-    auto normal   = eval_shading_normal(scene, intersection, outgoing);
-    auto material = eval_material(scene, intersection);
-    auto emission = eval_emission(material, normal, outgoing);
-
-    const auto needs_delta_function = material.roughness == 0;
-
-    // // handle opacity
-    if (material.opacity < 1 && rand1f(rng) >= material.opacity) {
-      if (opbounce++ > 128) break;
-      ray = {position + ray.d * 1e-2f, ray.d};
-      bounce -= 1;
-      continue;
-    }
-
-    // set hit variables
-    if (bounce == 0) {
-      hit        = true;
-      hit_albedo = material.color;
-      hit_normal = normal;
-    }
-
-    // accumulate emission
-    radiance += weight * emission;
 
     auto path_segment = path_segments.NextSegment();
     if (!path_segment) {
       std::printf("Failed to create a new path segment\n");
     }
 
-    openpgl::cpp::SetPosition(
-        path_segment, {position.x, position.y, position.z});
-    openpgl::cpp::SetRoughness(path_segment, material.roughness);
-    openpgl::cpp::SetDirectionOut(
-        path_segment, {outgoing.x, outgoing.y, outgoing.z});
-    openpgl::cpp::SetVolumeScatter(path_segment, false);
-    openpgl::cpp::SetDirectContribution(
-        path_segment, {emission.x, emission.y, emission.z});
-    openpgl::cpp::SetEta(path_segment, material.ior);
-    openpgl::cpp::SetIsDelta(path_segment, needs_delta_function);
+    auto guiding_info = guiding::Unused;
 
     auto       rand_guiding_probability = rand1f(rng);
     const bool should_use_guiding       = rand_guiding_probability <
                                     g_path_guiding_prob;
-    const bool can_init_guiding_distrib = [&]() {
-      return g_guiding_field.init_surface_distrib(
-          surface_distrib, position, rand_guiding_probability);
-    }();
-    const bool guiding_in_use = should_use_guiding && can_init_guiding_distrib;
 
-    const auto sample_new_direction = [&]() {
-      if (guiding_in_use) {
-        surface_distrib.ApplyCosineProduct({normal.x, normal.y, normal.z});
-        auto guided_direction = surface_distrib.Sample(
-            {rand1f(rng), rand1f(rng)});
-        // rand_guiding_probability /= g_path_guiding_prob;
-        return vec3f{
-            guided_direction.x, guided_direction.y, guided_direction.z};
+    auto in_volume = false;
+    if (!volume_stack.empty()) {
+      auto& vsdf     = volume_stack.back();
+      auto  distance = sample_transmittance(
+          vsdf.density, intersection.distance, rand1f(rng), rand1f(rng));
+      auto transmittance = eval_transmittance(vsdf.density, distance) /
+                           sample_transmittance_pdf(
+                               vsdf.density, distance, intersection.distance);
+      weight *= transmittance;
+      if (transmittance != vec3f{0, 0, 0} && isfinite(transmittance)) {
+        openpgl::cpp::SetTransmittanceWeight(
+            path_segment, {transmittance.x, transmittance.y, transmittance.z});
+      }
+      in_volume             = distance < intersection.distance;
+      intersection.distance = distance;
+    }
+
+    if (!in_volume) {
+      // prepare shading point
+      auto outgoing = -ray.d;
+      auto position = eval_shading_position(scene, intersection, outgoing);
+      auto normal   = eval_shading_normal(scene, intersection, outgoing);
+      auto material = eval_material(scene, intersection);
+
+      const auto needs_delta_function = is_delta(material);
+
+      // correct roughness
+      // if (params.nocaustics) {
+      //   max_roughness      = max(material.roughness, max_roughness);
+      //   material.roughness = max_roughness;
+      // }
+
+      // handle opacity
+      if (material.opacity < 1 && rand1f(rng) >= material.opacity) {
+        if (opbounce++ > 128) break;
+        ray = {position + ray.d * 1e-2f, ray.d};
+        bounce -= 1;
+        continue;
       }
 
-      // rand_guiding_probability -= g_path_guiding_prob;
-      // rand_guiding_probability /= 1.0f - g_path_guiding_prob;
+      // set hit variables
+      if (bounce == 0) {
+        hit        = true;
+        hit_albedo = material.color;
+        hit_normal = normal;
+      }
+
+      openpgl::cpp::SetPosition(
+          path_segment, {position.x, position.y, position.z});
+      openpgl::cpp::SetRoughness(path_segment, material.roughness);
+      openpgl::cpp::SetDirectionOut(
+          path_segment, {outgoing.x, outgoing.y, outgoing.z});
+      openpgl::cpp::SetEta(path_segment, material.ior);
+      openpgl::cpp::SetIsDelta(path_segment, needs_delta_function);
+
+      auto emission = eval_emission(material, normal, outgoing);
+      // accumulate emission
+      radiance += weight * emission;
+      openpgl::cpp::SetDirectContribution(
+          path_segment, {emission.x, emission.y, emission.z});
+
+      if (g_guiding_field.init_distrib(
+              surface_distrib, position, rand_guiding_probability)) {
+        guiding_info = guiding::Tentative;
+
+        if (should_use_guiding) {
+          guiding_info = guiding::InUse;
+        }
+      }
+
+      const auto sample_new_direction = [&](bool sample_light) {
+        if (guiding_info == guiding::InUse) {
+          surface_distrib.ApplyCosineProduct({normal.x, normal.y, normal.z});
+          auto guided_direction = surface_distrib.Sample(
+              {rand1f(rng), rand1f(rng)});
+          // rand_guiding_probability /= g_path_guiding_prob;
+          return vec3f{
+              guided_direction.x, guided_direction.y, guided_direction.z};
+        }
+
+        // rand_guiding_probability -= g_path_guiding_prob;
+        // rand_guiding_probability /= 1.0f - g_path_guiding_prob;
+
+        auto rand_pick_light = rand1f(rng) < 0.5f;
+
+        if (!needs_delta_function && !rand_pick_light) {
+          // Sample a new direction with just the BSDF
+          return sample_bsdfcos(
+              material, normal, outgoing, rand1f(rng), rand2f(rng));
+        } else if (!needs_delta_function && rand_pick_light) {
+          return sample_lights(
+              scene, lights, position, rand1f(rng), rand1f(rng), rand2f(rng));
+        } else {
+          // Sample a new direction with a BSDF that is a delta function
+          return sample_delta(material, normal, outgoing, rand1f(rng));
+        }
+      };
+
+      auto incoming   = vec3f{0, 0, 0};
+      auto bsdf       = vec3f{0.0f, 0.0f, 0.0f};
+      auto pdf        = 0.0f;
+      auto mis_weight = 0.0f;
 
       if (!needs_delta_function) {
-        // Sample a new direction with just the BSDF
-        return sample_bsdfcos(
-            material, normal, outgoing, rand1f(rng), rand2f(rng));
+        incoming = sample_new_direction(false);
+        if (incoming == vec3f{0, 0, 0}) break;
+        bsdf          = eval_bsdfcos(material, normal, outgoing, incoming);
+        auto bsdf_pdf = sample_bsdfcos_pdf(
+            material, normal, outgoing, incoming);
+        auto light_pdf = sample_lights_pdf(
+            scene, bvh, lights, position, incoming);
+
+        pdf = 0.5f * bsdf_pdf + 0.5f * light_pdf;
       } else {
-        // Sample a new direction with a BSDF that is a delta function
-        return sample_delta(material, normal, outgoing, rand1f(rng));
+        incoming = sample_new_direction(false);
+        if (incoming == vec3f{0, 0, 0}) break;
+        bsdf = eval_delta(material, normal, outgoing, incoming);
+        pdf  = sample_delta_pdf(material, normal, outgoing, incoming);
       }
-    };
 
-    auto incoming = sample_new_direction();
-    if (incoming == vec3f{0, 0, 0}) break;
+      // Adjust the PDF based on if we were able or not to use path guiding.
+      pdf = adjust_pdf_for_guiding(
+          pdf, incoming, surface_distrib, rng, guiding_info);
 
-    auto bsdf = vec3f{0.0f, 0.0f, 0.0f};
-    auto pdf  = 0.0f;
+      const auto scattering_weight = bsdf / pdf;
+      weight *= scattering_weight;
 
-    if (!needs_delta_function) {
-      bsdf = eval_bsdfcos(material, normal, outgoing, incoming);
-      pdf  = sample_bsdfcos_pdf(material, normal, outgoing, incoming);
+      // update volume stack
+      if (is_volumetric(scene, intersection) &&
+          dot(normal, outgoing) * dot(normal, incoming) < 0) {
+        if (volume_stack.empty()) {
+          auto material = eval_material(scene, intersection);
+          volume_stack.push_back(material);
+        } else {
+          volume_stack.pop_back();
+        }
+      }
+
+      // check weight
+      if (weight == vec3f{0, 0, 0} || !isfinite(weight)) {
+        break;
+      }
+
+      openpgl::cpp::SetScatteringWeight(path_segment,
+          {scattering_weight.x, scattering_weight.y, scattering_weight.z});
+      openpgl::cpp::SetNormal(path_segment, {normal.x, normal.y, normal.z});
+      openpgl::cpp::SetDirectionIn(
+          path_segment, {incoming.x, incoming.y, incoming.z});
+      openpgl::cpp::SetPDFDirectionIn(path_segment, pdf);
+
+      // setup next iteration
+      ray = {position, incoming};
     } else {
-      bsdf = eval_delta(material, normal, outgoing, incoming);
-      pdf  = sample_delta_pdf(material, normal, outgoing, incoming);
+      // We are inside a volume
+
+      auto  outgoing = -ray.d;
+      auto  position = ray.o + ray.d * intersection.distance;
+      auto& vsdf     = volume_stack.back();
+
+      openpgl::cpp::SetVolumeScatter(path_segment, true);
+      openpgl::cpp::SetDirectionOut(
+          path_segment, {outgoing.x, outgoing.y, outgoing.z});
+      openpgl::cpp::SetPosition(
+          path_segment, {position.x, position.y, position.z});
+
+      if (g_guiding_field.init_distrib(
+              volume_distrib, position, rand_guiding_probability)) {
+        guiding_info = guiding::Tentative;
+
+        if (should_use_guiding) {
+          guiding_info = guiding::InUse;
+        }
+      }
+
+      auto incoming = vec3f{0, 0, 0};
+
+      if (guiding_info == guiding::InUse) {
+        auto direction = volume_distrib.Sample({rand1f(rng), rand1f(rng)});
+        incoming       = {direction.x, direction.y, direction.z};
+      } else if (rand1f(rng) < 0.5f) {
+        incoming = sample_scattering(vsdf, outgoing, rand1f(rng), rand2f(rng));
+      } else {
+        incoming = sample_lights(
+            scene, lights, position, rand1f(rng), rand1f(rng), rand2f(rng));
+      }
+
+      auto pdf =
+          (0.5f * sample_scattering_pdf(vsdf, outgoing, incoming) +
+              0.5f * sample_lights_pdf(scene, bvh, lights, position, incoming));
+      if (incoming == vec3f{0, 0, 0}) break;
+      pdf = adjust_pdf_for_guiding(
+          pdf, incoming, volume_distrib, rng, guiding_info);
+      const auto scattering_weight = eval_scattering(vsdf, outgoing, incoming) /
+                                     pdf;
+      weight *= scattering_weight;
+
+      // check weight
+      if (weight == vec3f{0, 0, 0} || !isfinite(weight)) {
+        break;
+      }
+
+      openpgl::cpp::SetDirectionIn(
+          path_segment, {incoming.x, incoming.y, incoming.z});
+      openpgl::cpp::SetPDFDirectionIn(path_segment, pdf);
+      openpgl::cpp::SetScatteringWeight(path_segment,
+          {scattering_weight.x, scattering_weight.y, scattering_weight.z});
+      // setup next iteration
+      ray = {position, incoming};
     }
-
-    // Adjust the PDF based on if we were able or not to use path guiding.
-    if (guiding_in_use) {
-      // We won the lottery and we used guiding for sampling the new direction.
-
-      // std::printf("Using path guiding\n");
-      auto       direction = pgl_vec3f{incoming.x, incoming.y, incoming.z};
-      const auto guided_sample_pdf = surface_distrib.SamplePDF(
-          {rand1f(rng), rand1f(rng)}, direction);
-
-      // Prob BSDF * PDF + Prob Guiding * GPDF
-      pdf *= (1.0f - g_path_guiding_prob);
-      pdf += g_path_guiding_prob * guided_sample_pdf;
-    } else if (can_init_guiding_distrib) {
-      // We lost the lottery and we didn't use guiding while it _was possible_
-      // to do so. In this case we adjust the total PDF to account for the
-      // missed chance.
-
-      auto       direction   = pgl_vec3f{incoming.x, incoming.y, incoming.z};
-      const auto guiding_pdf = surface_distrib.PDF(direction);
-      const auto before_pdf  = pdf;
-      pdf *= (1.0f - g_path_guiding_prob);
-      pdf += g_path_guiding_prob * guiding_pdf;
-
-      // std::printf(
-      //     "Wanted to use guiding but couldn't: %f -> %f\n", before_pdf, pdf);
-    }
-
-    const auto scattering_weight = bsdf / pdf;
-    weight *= scattering_weight;
-
-    // check weight
-    if (weight == vec3f{0, 0, 0} || !isfinite(weight)) {
-      break;
-    }
-
-    openpgl::cpp::SetScatteringWeight(path_segment,
-        {scattering_weight.x, scattering_weight.y, scattering_weight.z});
-    openpgl::cpp::SetNormal(path_segment, {normal.x, normal.y, normal.z});
-    openpgl::cpp::SetDirectionIn(
-        path_segment, {incoming.x, incoming.y, incoming.z});
-    openpgl::cpp::SetPDFDirectionIn(path_segment, pdf);
 
     // russian roulette
     if (bounce > 3) {
       auto rr_prob = min((float)0.99, max(weight));
-      openpgl::cpp::SetRussianRouletteProbability(path_segment, rr_prob);
       if (rand1f(rng) >= rr_prob) break;
+      openpgl::cpp::SetRussianRouletteProbability(path_segment, rr_prob);
       weight *= 1 / rr_prob;
     }
-
-    // setup next iteration
-    ray = {position, incoming};
   }
 
   // if (!path_segments.ValidateSamples()) {
@@ -1353,18 +1393,13 @@ static trace_result trace_pathguiding(const scene_data& scene,
   // }
 
   auto n_generated_samples = path_segments.PrepareSamples(
-      false, nullptr, false, false, true);
+      false, nullptr, false, false, false);
 
   if (n_generated_samples > 0) {
     auto generated_samples = path_segments.GetSamples(n_generated_samples);
     g_opgl_samples.AddSamples(generated_samples, n_generated_samples);
     g_guiding_field.update(g_opgl_samples);
   }
-
-  // std::printf("Currently stored %lu samples\n", current_samples);
-
-  // if (g_opgl_samples.GetSizeSurface() > 10000) {
-  // }
 
   return {radiance, hit, hit_albedo, hit_normal};
 }
