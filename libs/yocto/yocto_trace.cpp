@@ -1264,8 +1264,8 @@ static trace_result trace_pathguiding(const scene_data& scene,
             incoming = sample_bsdfcos(
                 material, normal, outgoing, rand1f(rng), rand2f(rng));
           } else {
-            incoming - sample_lights(scene, lights, position, rand1f(rng),
-                           rand1f(rng), rand2f(rng));
+            incoming = sample_lights(
+                scene, lights, position, rand1f(rng), rand1f(rng), rand2f(rng));
           }
         }
 
