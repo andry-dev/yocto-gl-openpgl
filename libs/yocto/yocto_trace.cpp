@@ -1130,6 +1130,9 @@ static trace_result trace_pathguiding(const scene_data& scene,
   auto volume_distrib = g_guiding_field.create_sample_distribution<
       openpgl::cpp::VolumeSamplingDistribution>();
 
+  const auto training            = g_guiding_field.should_train();
+  const auto training_iterations = g_guiding_field.iterations();
+
   // initialize
   auto radiance     = vec3f{0, 0, 0};
   auto weight       = vec3f{1, 1, 1};
@@ -1246,8 +1249,7 @@ static trace_result trace_pathguiding(const scene_data& scene,
       auto pdf        = 0.0f;
       auto mis_weight = 0.0f;
 
-      if (guiding_info == guiding::InUse) {
-        surface_distrib.ApplyCosineProduct(to_pgl(normal));
+      if (!needs_delta_function && guiding_info == guiding::InUse) {
         auto guided_direction = surface_distrib.Sample(
             {rand1f(rng), rand1f(rng)});
         // std::printf("Using guiding\n");
@@ -1277,9 +1279,7 @@ static trace_result trace_pathguiding(const scene_data& scene,
 
         pdf = 0.5f * bsdf_pdf + 0.5f * light_pdf;
       } else {
-        if (incoming == vec3f{0, 0, 0}) {
-          incoming = sample_delta(material, normal, outgoing, rand1f(rng));
-        }
+        incoming = sample_delta(material, normal, outgoing, rand1f(rng));
         if (incoming == vec3f{0, 0, 0}) break;
         bsdf = eval_delta(material, normal, outgoing, incoming);
         pdf  = sample_delta_pdf(material, normal, outgoing, incoming);

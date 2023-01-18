@@ -26,7 +26,14 @@ inline auto get_default_field_arguments() {
 }
 }  // namespace details
 
-constexpr auto g_max_training_samples = 128;
+inline pgl_vec3f to_pgl(const vec3f& v) { return {v.x, v.y, v.z}; }
+inline pgl_vec2f to_pgl(const vec2f& v) { return {v.x, v.y}; }
+inline vec3f     from_pgl(const pgl_vec3f& v) { return {v.x, v.y, v.z}; }
+inline vec2f     from_pgl(const pgl_vec2f& v) { return {v.x, v.y}; }
+
+constexpr auto g_max_training_iterations = 128;
+constexpr auto g_min_training_iterations = g_max_training_iterations / 16;
+constexpr auto g_max_training_samples    = 1024;
 
 struct guiding_field {
   guiding_field(openpgl::cpp::Device& device)
@@ -40,11 +47,11 @@ struct guiding_field {
 
     const auto num_samples = sample_storage.GetSizeSurface() +
                              sample_storage.GetSizeVolume();
-    if (num_samples >= 2048) {
+    if (num_samples >= g_max_training_samples) {
       m_field.Update(sample_storage);
       sample_storage.Clear();
 
-      if (m_field.GetIteration() >= g_max_training_samples) {
+      if (m_field.GetIteration() >= g_max_training_iterations) {
         m_train = false;
       }
 
@@ -63,10 +70,11 @@ struct guiding_field {
   bool init_distrib(T& distribution, vec3f position, float random_float) {
     std::lock_guard<std::mutex> guard{m_update_lock};
 
-    auto result = distribution.Init(
-        &m_field, {position.x, position.y, position.z}, random_float);
+    auto result = distribution.Init(&m_field, to_pgl(position), random_float);
     return result;
   }
+
+  auto iterations() { return m_field.GetIteration(); }
 
   bool should_train() { return m_train; }
 
@@ -118,10 +126,5 @@ inline float adjust_pdf_for_guiding(float pdf, vec3f incoming,
     default: return pdf;
   }
 }
-
-inline pgl_vec3f to_pgl(const vec3f& v) { return {v.x, v.y, v.z}; }
-inline pgl_vec2f to_pgl(const vec2f& v) { return {v.x, v.y}; }
-inline vec3f     from_pgl(const pgl_vec3f& v) { return {v.x, v.y, v.z}; }
-inline vec2f     from_pgl(const pgl_vec2f& v) { return {v.x, v.y}; }
 
 }  // namespace yocto
