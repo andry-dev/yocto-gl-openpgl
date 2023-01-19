@@ -1118,8 +1118,282 @@ static trace_result trace_naive(const scene_data& scene, const trace_bvh& bvh,
   return {radiance, hit, hit_albedo, hit_normal};
 }
 
-// Recursive path tracing with path guiding.
+// Recursive path tracing with path guiding
 static trace_result trace_pathguiding(const scene_data& scene,
+    const trace_bvh& bvh, const trace_lights& lights, const ray3f& ray_,
+    rng_state& rng, const trace_params& params, guiding_data& guiding) {
+  auto path_segments = openpgl::cpp::PathSegmentStorage{};
+  path_segments.Reserve(params.bounces + 2);
+
+  auto surface_distrib = g_guiding_field.create_sample_distribution<
+      openpgl::cpp::SurfaceSamplingDistribution>();
+  auto volume_distrib = g_guiding_field.create_sample_distribution<
+      openpgl::cpp::VolumeSamplingDistribution>();
+
+  const auto training            = g_guiding_field.should_train();
+  const auto training_iterations = g_guiding_field.iterations();
+
+  // initialize
+  auto radiance     = vec3f{0, 0, 0};
+  auto weight       = vec3f{1, 1, 1};
+  auto ray          = ray_;
+  auto volume_stack = vector<material_point>{};
+  auto hit          = false;
+  auto hit_albedo   = vec3f{0, 0, 0};
+  auto hit_normal   = vec3f{0, 0, 0};
+  auto opbounce     = 0;
+
+  int bounce = 0;
+  // trace  path
+  for (bounce = 0; bounce < params.bounces; bounce++) {
+    // intersect next point
+    auto intersection = intersect_scene(bvh, scene, ray);
+
+    auto path_segment = path_segments.NextSegment();
+    if (!path_segment) {
+      std::printf("Failed to create a new path segment\n");
+    }
+
+    if (!intersection.hit) {
+      if ((bounce > 0 || !params.envhidden)) {
+        auto emission = eval_environment(scene, ray.d);
+        radiance += weight * emission;
+        auto outgoing = -ray.d;
+        openpgl::cpp::SetDirectContribution(path_segment, to_pgl(emission));
+        openpgl::cpp::SetDirectionOut(path_segment, to_pgl(outgoing));
+      }
+      break;
+    }
+
+    auto guiding_info = guiding::Unused;
+
+    auto       rand_guiding_probability = rand1f(rng);
+    const bool should_use_guiding       = rand_guiding_probability <
+                                    g_path_guiding_prob;
+
+    auto in_volume = false;
+    if (!volume_stack.empty()) {
+      auto& vsdf     = volume_stack.back();
+      auto  distance = sample_transmittance(
+          vsdf.density, intersection.distance, rand1f(rng), rand1f(rng));
+      auto transmittance = eval_transmittance(vsdf.density, distance) /
+                           sample_transmittance_pdf(
+                               vsdf.density, distance, intersection.distance);
+      weight *= transmittance;
+      if (transmittance != vec3f{0, 0, 0} && isfinite(transmittance)) {
+        openpgl::cpp::SetTransmittanceWeight(
+            path_segment, {transmittance.x, transmittance.y, transmittance.z});
+      }
+      in_volume             = distance < intersection.distance;
+      intersection.distance = distance;
+    }
+
+    if (!in_volume) {
+      // prepare shading point
+      auto outgoing = -ray.d;
+      auto position = eval_shading_position(scene, intersection, outgoing);
+      auto normal   = eval_shading_normal(scene, intersection, outgoing);
+      auto material = eval_material(scene, intersection);
+
+      const auto needs_delta_function = is_delta(material);
+
+      // correct roughness
+      // if (params.nocaustics) {
+      //   max_roughness      = max(material.roughness, max_roughness);
+      //   material.roughness = max_roughness;
+      // }
+
+      // handle opacity
+      if (material.opacity < 1 && rand1f(rng) >= material.opacity) {
+        if (opbounce++ > 128) break;
+        ray = {position + ray.d * 1e-2f, ray.d};
+        bounce -= 1;
+        continue;
+      }
+
+      // set hit variables
+      if (bounce == 0) {
+        hit        = true;
+        hit_albedo = material.color;
+        hit_normal = normal;
+      }
+
+      openpgl::cpp::SetPosition(path_segment, to_pgl(position));
+      openpgl::cpp::SetRoughness(path_segment, material.roughness);
+      openpgl::cpp::SetDirectionOut(path_segment, to_pgl(outgoing));
+      openpgl::cpp::SetEta(path_segment, material.ior);
+      openpgl::cpp::SetIsDelta(path_segment, needs_delta_function);
+
+      // accumulate emission
+      auto emission = eval_emission(material, normal, outgoing);
+      openpgl::cpp::SetDirectContribution(path_segment, to_pgl(emission));
+      radiance += weight * emission;
+
+      if (g_guiding_field.init_distrib(
+              surface_distrib, position, rand_guiding_probability)) {
+        surface_distrib.ApplyCosineProduct(to_pgl(normal));
+        guiding_info = guiding::Tentative;
+
+        if (should_use_guiding) {
+          guiding_info = guiding::InUse;
+        }
+      }
+
+      auto incoming = vec3f{0, 0, 0};
+      auto bsdf     = vec3f{0.0f, 0.0f, 0.0f};
+      auto pdf      = 0.0f;
+
+      if (!needs_delta_function) {
+        if (guiding_info == guiding::InUse) {
+          incoming = from_pgl(surface_distrib.Sample(to_pgl(rand2f(rng))));
+        } else if (rand1f(rng) < 0.5f) {
+          // Sample a new direction with just the BSDF
+          incoming = sample_bsdfcos(
+              material, normal, outgoing, rand1f(rng), rand2f(rng));
+        } else {
+          incoming = sample_lights(
+              scene, lights, position, rand1f(rng), rand1f(rng), rand2f(rng));
+        }
+
+        if (incoming == vec3f{0, 0, 0}) break;
+
+        bsdf          = eval_bsdfcos(material, normal, outgoing, incoming);
+        auto bsdf_pdf = sample_bsdfcos_pdf(
+            material, normal, outgoing, incoming);
+        auto light_pdf = sample_lights_pdf(
+            scene, bvh, lights, position, incoming);
+
+        pdf = (0.5f * bsdf_pdf + 0.5f * light_pdf);
+      } else {
+        incoming = sample_delta(material, normal, outgoing, rand1f(rng));
+        if (incoming == vec3f{0, 0, 0}) break;
+        bsdf = eval_delta(material, normal, outgoing, incoming);
+        pdf  = sample_delta_pdf(material, normal, outgoing, incoming);
+      }
+
+      // Adjust the PDF based on if we were able or not to use path guiding.
+      pdf = adjust_pdf_for_guiding(
+          pdf, incoming, surface_distrib, rng, guiding_info);
+
+      const auto scattering_weight = bsdf / pdf;
+      weight *= scattering_weight;
+
+      // update volume stack
+      if (is_volumetric(scene, intersection) &&
+          dot(normal, outgoing) * dot(normal, incoming) < 0) {
+        if (volume_stack.empty()) {
+          auto material = eval_material(scene, intersection);
+          volume_stack.push_back(material);
+        } else {
+          volume_stack.pop_back();
+        }
+      }
+
+      // check weight
+      if (weight == vec3f{0, 0, 0} || !isfinite(weight)) {
+        break;
+      }
+
+      openpgl::cpp::SetScatteringWeight(
+          path_segment, to_pgl(scattering_weight));
+      openpgl::cpp::SetNormal(path_segment, to_pgl(normal));
+      openpgl::cpp::SetDirectionIn(path_segment, to_pgl(incoming));
+      openpgl::cpp::SetPDFDirectionIn(path_segment, pdf);
+
+      // setup next iteration
+      ray = {position, incoming};
+    } else {
+      // We are inside a volume
+
+      auto  outgoing = -ray.d;
+      auto  position = ray.o + ray.d * intersection.distance;
+      auto& vsdf     = volume_stack.back();
+
+      openpgl::cpp::SetVolumeScatter(path_segment, true);
+      openpgl::cpp::SetDirectionOut(path_segment, to_pgl(outgoing));
+      openpgl::cpp::SetPosition(path_segment, to_pgl(position));
+      openpgl::cpp::SetRoughness(path_segment, vsdf.roughness);
+      openpgl::cpp::SetEta(path_segment, vsdf.ior);
+      openpgl::cpp::SetDirectContribution(path_segment, to_pgl(vsdf.emission));
+      openpgl::cpp::SetScatteredContribution(
+          path_segment, to_pgl(vsdf.scattering));
+
+      if (g_guiding_field.init_distrib(
+              volume_distrib, position, rand_guiding_probability)) {
+        volume_distrib.ApplySingleLobeHenyeyGreensteinProduct(
+            to_pgl(outgoing), vsdf.scanisotropy);
+        guiding_info = guiding::Tentative;
+
+        if (should_use_guiding) {
+          guiding_info = guiding::InUse;
+        }
+      }
+
+      auto incoming = vec3f{0, 0, 0};
+
+      if (guiding_info == guiding::InUse) {
+        const auto direction = volume_distrib.Sample(
+            {rand1f(rng), rand1f(rng)});
+        incoming = from_pgl(direction);
+      } else if (rand1f(rng) < 0.5f) {
+        incoming = sample_scattering(vsdf, outgoing, rand1f(rng), rand2f(rng));
+      } else {
+        incoming = sample_lights(
+            scene, lights, position, rand1f(rng), rand1f(rng), rand2f(rng));
+      }
+
+      auto pdf =
+          (0.5f * sample_scattering_pdf(vsdf, outgoing, incoming) +
+              0.5f * sample_lights_pdf(scene, bvh, lights, position, incoming));
+      if (incoming == vec3f{0, 0, 0}) break;
+      pdf = adjust_pdf_for_guiding(
+          pdf, incoming, volume_distrib, rng, guiding_info);
+      const auto scattering_weight = eval_scattering(vsdf, outgoing, incoming) /
+                                     pdf;
+      weight *= scattering_weight;
+
+      // check weight
+      if (weight == vec3f{0, 0, 0} || !isfinite(weight)) {
+        break;
+      }
+
+      openpgl::cpp::SetDirectionIn(path_segment, to_pgl(incoming));
+      openpgl::cpp::SetPDFDirectionIn(path_segment, pdf);
+      openpgl::cpp::SetScatteringWeight(
+          path_segment, to_pgl(scattering_weight));
+      // setup next iteration
+      ray = {position, incoming};
+    }
+
+    // russian roulette
+    if (bounce > 3) {
+      auto rr_prob = min((float)0.99, max(weight));
+      if (rand1f(rng) >= rr_prob) break;
+      openpgl::cpp::SetRussianRouletteProbability(path_segment, rr_prob);
+      weight *= 1 / rr_prob;
+    }
+  }
+
+  // if (!path_segments.ValidateSamples()) {
+  //   std::printf("Path segment storage not valid\n");
+  // }
+
+  if (g_guiding_field.should_train()) {
+    auto n_generated_samples = path_segments.PrepareSamples(
+        false, nullptr, false, true, false);
+
+    if (n_generated_samples > 0) {
+      auto generated_samples = path_segments.GetSamples(n_generated_samples);
+      g_opgl_samples.AddSamples(generated_samples, n_generated_samples);
+      g_guiding_field.update(g_opgl_samples);
+    }
+  }
+
+  return {radiance, hit, hit_albedo, hit_normal};
+}
+
+// Recursive path tracing with path guiding and MIS
+static trace_result trace_pathguidingmis(const scene_data& scene,
     const trace_bvh& bvh, const trace_lights& lights, const ray3f& ray_,
     rng_state& rng, const trace_params& params, guiding_data& guiding) {
   auto path_segments = openpgl::cpp::PathSegmentStorage{};
@@ -1779,6 +2053,7 @@ static sampler_func get_trace_sampler_func(const trace_params& params) {
     case trace_sampler_type::pathmis: return trace_pathmis;
     case trace_sampler_type::pathtest: return trace_pathtest;
     case trace_sampler_type::pathguiding: return trace_pathguiding;
+    case trace_sampler_type::pathguidingmis: return trace_pathguidingmis;
     case trace_sampler_type::naive: return trace_naive;
     // case trace_sampler_type::eyelight: return trace_eyelight;
     // case trace_sampler_type::diagram: return trace_diagram;
@@ -1798,6 +2073,7 @@ bool is_sampler_lit(const trace_params& params) {
     case trace_sampler_type::pathdirect: return true;
     case trace_sampler_type::pathmis: return true;
     case trace_sampler_type::pathguiding: return true;
+    case trace_sampler_type::pathguidingmis: return true;
     case trace_sampler_type::naive: return true;
     case trace_sampler_type::eyelight: return false;
     case trace_sampler_type::furnace: return true;
