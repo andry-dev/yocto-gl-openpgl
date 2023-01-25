@@ -91,7 +91,7 @@ enum class guiding {
   Unused,
 };
 
-constexpr float g_path_guiding_prob = 0.50f;
+constexpr float g_path_guiding_prob = 0.75f;
 
 template <typename T>
 inline float adjust_pdf_for_guiding(float pdf, vec3f incoming,

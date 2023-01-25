@@ -463,7 +463,7 @@ struct trace_result {
 // Recursive path tracing.
 static trace_result trace_path(const scene_data& scene, const trace_bvh& bvh,
     const trace_lights& lights, const ray3f& ray_, rng_state& rng,
-    const trace_params& params, guiding_data&) {
+    const trace_params& params) {
   // initialize
   auto radiance      = vec3f{0, 0, 0};
   auto weight        = vec3f{1, 1, 1};
@@ -609,7 +609,7 @@ static trace_result trace_path(const scene_data& scene, const trace_bvh& bvh,
 // Recursive path tracing.
 static trace_result trace_pathdirect(const scene_data& scene,
     const trace_bvh& bvh, const trace_lights& lights, const ray3f& ray_,
-    rng_state& rng, const trace_params& params, guiding_data&) {
+    rng_state& rng, const trace_params& params) {
   // initialize
   auto radiance      = vec3f{0, 0, 0};
   auto weight        = vec3f{1, 1, 1};
@@ -780,7 +780,7 @@ static trace_result trace_pathdirect(const scene_data& scene,
 // Recursive path tracing with MIS.
 static trace_result trace_pathmis(const scene_data& scene, const trace_bvh& bvh,
     const trace_lights& lights, const ray3f& ray_, rng_state& rng,
-    const trace_params& params, guiding_data&) {
+    const trace_params& params) {
   // initialize
   auto radiance      = vec3f{0, 0, 0};
   auto weight        = vec3f{1, 1, 1};
@@ -963,7 +963,7 @@ static trace_result trace_pathmis(const scene_data& scene, const trace_bvh& bvh,
 // Recursive path tracing.
 static trace_result trace_pathtest(const scene_data& scene,
     const trace_bvh& bvh, const trace_lights& lights, const ray3f& ray_,
-    rng_state& rng, const trace_params& params, guiding_data&) {
+    rng_state& rng, const trace_params& params) {
   // initialize
   auto radiance      = vec3f{0, 0, 0};
   auto weight        = vec3f{1, 1, 1};
@@ -1042,7 +1042,7 @@ static trace_result trace_pathtest(const scene_data& scene,
 // Recursive path tracing.
 static trace_result trace_naive(const scene_data& scene, const trace_bvh& bvh,
     const trace_lights& lights, const ray3f& ray_, rng_state& rng,
-    const trace_params& params, guiding_data&) {
+    const trace_params& params) {
   // initialize
   auto radiance   = vec3f{0, 0, 0};
   auto weight     = vec3f{1, 1, 1};
@@ -1121,7 +1121,7 @@ static trace_result trace_naive(const scene_data& scene, const trace_bvh& bvh,
 // Recursive path tracing with path guiding
 static trace_result trace_pathguiding(const scene_data& scene,
     const trace_bvh& bvh, const trace_lights& lights, const ray3f& ray_,
-    rng_state& rng, const trace_params& params, guiding_data& guiding) {
+    rng_state& rng, const trace_params& params) {
   auto path_segments = openpgl::cpp::PathSegmentStorage{};
   path_segments.Reserve(params.bounces + 2);
 
@@ -1244,12 +1244,14 @@ static trace_result trace_pathguiding(const scene_data& scene,
       auto pdf      = 0.0f;
 
       if (!needs_delta_function) {
-        if (guiding_info == guiding::InUse) {
-          incoming = from_pgl(surface_distrib.Sample(to_pgl(rand2f(rng))));
-        } else if (rand1f(rng) < 0.5f) {
-          // Sample a new direction with just the BSDF
-          incoming = sample_bsdfcos(
-              material, normal, outgoing, rand1f(rng), rand2f(rng));
+        if (rand1f(rng) < 0.5f) {
+          if (guiding_info == guiding::InUse) {
+            incoming = from_pgl(surface_distrib.Sample(to_pgl(rand2f(rng))));
+          } else {
+            // Sample a new direction with just the BSDF
+            incoming = sample_bsdfcos(
+                material, normal, outgoing, rand1f(rng), rand2f(rng));
+          }
         } else {
           incoming = sample_lights(
               scene, lights, position, rand1f(rng), rand1f(rng), rand2f(rng));
@@ -1260,6 +1262,10 @@ static trace_result trace_pathguiding(const scene_data& scene,
         bsdf          = eval_bsdfcos(material, normal, outgoing, incoming);
         auto bsdf_pdf = sample_bsdfcos_pdf(
             material, normal, outgoing, incoming);
+        if (guiding_info != guiding::Unused) {
+          bsdf_pdf = adjust_pdf_for_guiding(
+              bsdf_pdf, incoming, surface_distrib, rng, guiding_info);
+        }
         auto light_pdf = sample_lights_pdf(
             scene, bvh, lights, position, incoming);
 
@@ -1272,9 +1278,6 @@ static trace_result trace_pathguiding(const scene_data& scene,
       }
 
       // Adjust the PDF based on if we were able or not to use path guiding.
-      pdf = adjust_pdf_for_guiding(
-          pdf, incoming, surface_distrib, rng, guiding_info);
-
       const auto scattering_weight = bsdf / pdf;
       weight *= scattering_weight;
 
@@ -1331,23 +1334,29 @@ static trace_result trace_pathguiding(const scene_data& scene,
 
       auto incoming = vec3f{0, 0, 0};
 
-      if (guiding_info == guiding::InUse) {
-        const auto direction = volume_distrib.Sample(
-            {rand1f(rng), rand1f(rng)});
-        incoming = from_pgl(direction);
-      } else if (rand1f(rng) < 0.5f) {
-        incoming = sample_scattering(vsdf, outgoing, rand1f(rng), rand2f(rng));
+      if (rand1f(rng) < 0.5f) {
+        if (guiding_info == guiding::InUse) {
+          const auto direction = volume_distrib.Sample(
+              {rand1f(rng), rand1f(rng)});
+          incoming = from_pgl(direction);
+        } else {
+          incoming = sample_scattering(
+              vsdf, outgoing, rand1f(rng), rand2f(rng));
+        }
       } else {
         incoming = sample_lights(
             scene, lights, position, rand1f(rng), rand1f(rng), rand2f(rng));
       }
+      auto bsdf_pdf = sample_scattering_pdf(vsdf, outgoing, incoming);
+      if (guiding_info != guiding::Unused) {
+        bsdf_pdf = adjust_pdf_for_guiding(
+            bsdf_pdf, incoming, volume_distrib, rng, guiding_info);
+      }
+      const auto lights_pdf = sample_lights_pdf(
+          scene, bvh, lights, position, incoming);
 
-      auto pdf =
-          (0.5f * sample_scattering_pdf(vsdf, outgoing, incoming) +
-              0.5f * sample_lights_pdf(scene, bvh, lights, position, incoming));
+      auto pdf = (0.5f * bsdf_pdf + 0.5f * lights_pdf);
       if (incoming == vec3f{0, 0, 0}) break;
-      pdf = adjust_pdf_for_guiding(
-          pdf, incoming, volume_distrib, rng, guiding_info);
       const auto scattering_weight = eval_scattering(vsdf, outgoing, incoming) /
                                      pdf;
       weight *= scattering_weight;
@@ -1367,7 +1376,7 @@ static trace_result trace_pathguiding(const scene_data& scene,
 
     // russian roulette
     if (bounce > 3) {
-      auto rr_prob = min((float)0.99, max(weight));
+      auto rr_prob = min((float)0.99, sqrtf(max(weight)));
       if (rand1f(rng) >= rr_prob) break;
       openpgl::cpp::SetRussianRouletteProbability(path_segment, rr_prob);
       weight *= 1 / rr_prob;
@@ -1395,7 +1404,7 @@ static trace_result trace_pathguiding(const scene_data& scene,
 // Recursive path tracing with path guiding and MIS
 static trace_result trace_pathguidingmis(const scene_data& scene,
     const trace_bvh& bvh, const trace_lights& lights, const ray3f& ray_,
-    rng_state& rng, const trace_params& params, guiding_data& guiding) {
+    rng_state& rng, const trace_params& params) {
   auto path_segments = openpgl::cpp::PathSegmentStorage{};
   path_segments.Reserve(params.bounces + 2);
 
@@ -1508,11 +1517,15 @@ static trace_result trace_pathguidingmis(const scene_data& scene,
       openpgl::cpp::SetEta(path_segment, material.ior);
       openpgl::cpp::SetIsDelta(path_segment, needs_delta_function);
 
+      auto total_emission = vec3f{0, 0, 0};
+
       // accumulate emission
       if (next_emission) {
         auto emission = eval_emission(material, normal, outgoing);
-        openpgl::cpp::SetDirectContribution(path_segment, to_pgl(emission));
+        total_emission += emission;
         radiance += weight * emission;
+        openpgl::cpp::SetDirectContribution(
+            path_segment, to_pgl(total_emission));
       }
 
       if (g_guiding_field.init_distrib(
@@ -1530,20 +1543,22 @@ static trace_result trace_pathguidingmis(const scene_data& scene,
       auto pdf      = 0.0f;
 
       if (!needs_delta_function) {
-        auto mean_mis_weight = 0.0f;
-        auto mean_emission   = vec3f{0, 0, 0};
+        auto total_mis_weight = 0.0f;
 
         for (auto sample_light : {true, false}) {
-          // if (incoming == vec3f{0, 0, 0}) {
-          if (!sample_light) {
-            // Sample a new direction with just the BSDF
-            incoming = sample_bsdfcos(
-                material, normal, outgoing, rand1f(rng), rand2f(rng));
-          } else {
+          if (sample_light) {
             incoming = sample_lights(
                 scene, lights, position, rand1f(rng), rand1f(rng), rand2f(rng));
+          } else {
+            // Sample a new direction with just the BSDF
+            if (guiding_info == guiding::InUse) {
+              incoming = from_pgl(surface_distrib.Sample(to_pgl(rand2f(rng))));
+            } else {
+              // Sample a new direction with just the BSDF
+              incoming = sample_bsdfcos(
+                  material, normal, outgoing, rand1f(rng), rand2f(rng));
+            }
           }
-          // }
 
           if (incoming == vec3f{0, 0, 0}) break;
 
@@ -1553,10 +1568,15 @@ static trace_result trace_pathguidingmis(const scene_data& scene,
           auto light_pdf = sample_lights_pdf(
               scene, bvh, lights, position, incoming);
 
+          if (!sample_light && guiding_info != guiding::Unused) {
+            bsdf_pdf = adjust_pdf_for_guiding(
+                bsdf_pdf, incoming, surface_distrib, rng, guiding_info);
+          }
+
           auto mis_weight = sample_light
                                 ? mis_heuristic(light_pdf, bsdf_pdf) / light_pdf
                                 : mis_heuristic(bsdf_pdf, light_pdf) / bsdf_pdf;
-          mean_mis_weight += 0.5f * mis_weight;
+          total_mis_weight += mis_weight;
 
           if (bsdf != vec3f{0, 0, 0} && mis_weight != 0) {
             auto intersection = intersect_scene(
@@ -1575,42 +1595,33 @@ static trace_result trace_pathguidingmis(const scene_data& scene,
                            intersection.element, intersection.uv, -incoming),
                        -incoming);
             }
-            mean_emission += 0.5f * emission;
             radiance += weight * bsdf * emission * mis_weight;
+
+            openpgl::cpp::AddDirectContribution(
+                path_segment, to_pgl(emission * bsdf));
           }
 
-          pdf += 0.5f * (0.5f * bsdf_pdf + 0.5f * light_pdf);
+          pdf = bsdf_pdf;
         }
 
-        if (mean_mis_weight > 0.0f) {
-          openpgl::cpp::SetMiWeight(path_segment, mean_mis_weight);
-          openpgl::cpp::SetDirectContribution(
-              path_segment, to_pgl(mean_emission));
+        if (total_mis_weight != 0.0f) {
+          // openpgl::cpp::SetMiWeight(path_segment, total_mis_weight / 2.0f);
+          // openpgl::cpp::SetDirectContribution(
+          //     path_segment, to_pgl(total_emission));
         }
 
-        if (guiding_info == guiding::InUse) {
-          auto guided_direction = surface_distrib.Sample(
-              {rand1f(rng), rand1f(rng)});
-          // std::printf("Using guiding\n");
-          // rand_guiding_probability /= g_path_guiding_prob;
-          incoming = from_pgl(guided_direction);
-        }
-
-        bsdf = eval_bsdfcos(material, normal, outgoing, incoming);
-        pdf  = sample_bsdfcos_pdf(material, normal, outgoing, incoming);
         next_emission = false;
-
       } else {
         incoming = sample_delta(material, normal, outgoing, rand1f(rng));
         if (incoming == vec3f{0, 0, 0}) break;
-        bsdf          = eval_delta(material, normal, outgoing, incoming);
-        pdf           = sample_delta_pdf(material, normal, outgoing, incoming);
+        bsdf = eval_delta(material, normal, outgoing, incoming);
+        pdf  = sample_delta_pdf(material, normal, outgoing, incoming);
+        // pdf  = adjust_pdf_for_guiding(
+        //     pdf, incoming, surface_distrib, rng, guiding_info);
         next_emission = true;
       }
 
       // Adjust the PDF based on if we were able or not to use path guiding.
-      pdf = adjust_pdf_for_guiding(
-          pdf, incoming, surface_distrib, rng, guiding_info);
 
       const auto scattering_weight = bsdf / pdf;
       weight *= scattering_weight;
@@ -1668,25 +1679,32 @@ static trace_result trace_pathguidingmis(const scene_data& scene,
 
       auto incoming = vec3f{0, 0, 0};
 
-      if (guiding_info == guiding::InUse) {
-        const auto direction = volume_distrib.Sample(
-            {rand1f(rng), rand1f(rng)});
-        incoming = from_pgl(direction);
-      } else if (rand1f(rng) < 0.5f) {
-        incoming = sample_scattering(vsdf, outgoing, rand1f(rng), rand2f(rng));
+      if (rand1f(rng) < 0.5f) {
+        if (guiding_info == guiding::InUse) {
+          const auto direction = volume_distrib.Sample(
+              {rand1f(rng), rand1f(rng)});
+          incoming = from_pgl(direction);
+        } else {
+          incoming = sample_scattering(
+              vsdf, outgoing, rand1f(rng), rand2f(rng));
+        }
       } else {
         incoming = sample_lights(
             scene, lights, position, rand1f(rng), rand1f(rng), rand2f(rng));
       }
 
+      auto bsdf_pdf = sample_scattering_pdf(vsdf, outgoing, incoming);
+      if (guiding_info != guiding::Unused) {
+        bsdf_pdf = adjust_pdf_for_guiding(
+            bsdf_pdf, incoming, volume_distrib, rng, guiding_info);
+      }
+      const auto lights_pdf = sample_lights_pdf(
+          scene, bvh, lights, position, incoming);
+
       next_emission = true;
 
-      auto pdf =
-          (0.5f * sample_scattering_pdf(vsdf, outgoing, incoming) +
-              0.5f * sample_lights_pdf(scene, bvh, lights, position, incoming));
+      auto pdf = (0.5f * bsdf_pdf + 0.5f * lights_pdf);
       if (incoming == vec3f{0, 0, 0}) break;
-      pdf = adjust_pdf_for_guiding(
-          pdf, incoming, volume_distrib, rng, guiding_info);
       const auto scattering_weight = eval_scattering(vsdf, outgoing, incoming) /
                                      pdf;
       weight *= scattering_weight;
@@ -1706,7 +1724,7 @@ static trace_result trace_pathguidingmis(const scene_data& scene,
 
     // russian roulette
     if (bounce > 3) {
-      auto rr_prob = min((float)0.99, max(weight));
+      auto rr_prob = min((float)0.99, sqrtf(max(weight)));
       if (rand1f(rng) >= rr_prob) break;
       openpgl::cpp::SetRussianRouletteProbability(path_segment, rr_prob);
       weight *= 1 / rr_prob;
@@ -2045,7 +2063,7 @@ static trace_result trace_falsecolor(const scene_data& scene,
 // Trace a single ray from the camera using the given algorithm.
 using sampler_func = trace_result (*)(const scene_data& scene,
     const trace_bvh& bvh, const trace_lights& lights, const ray3f& ray,
-    rng_state& rng, const trace_params& params, guiding_data& guiding);
+    rng_state& rng, const trace_params& params);
 static sampler_func get_trace_sampler_func(const trace_params& params) {
   switch (params.sampler) {
     case trace_sampler_type::path: return trace_path;
@@ -2094,8 +2112,8 @@ void trace_sample(trace_state& state, const scene_data& scene,
   auto  idx     = state.width * j + i;
   auto  ray     = sample_camera(camera, {i, j}, {state.width, state.height},
            rand2f(state.rngs[idx]), rand2f(state.rngs[idx]), params.tentfilter);
-  auto [radiance, hit, albedo, normal] = sampler(scene, bvh, lights, ray,
-      state.rngs[idx], params, state.guiding_datas[idx]);
+  auto [radiance, hit, albedo, normal] = sampler(
+      scene, bvh, lights, ray, state.rngs[idx], params);
   if (!isfinite(radiance)) radiance = {0, 0, 0};
   if (max(radiance) > params.clamp)
     radiance = radiance * (params.clamp / max(radiance));
